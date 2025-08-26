@@ -6,24 +6,117 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 
-class Expert(nn.Module):
-    """A simple residual low-rank-style MLP expert (keeps residual pattern).
+"""
+DenseSmallMLPExpert implements a basic MLP block:
+    W2 * ReLU(W1 * x + b1) + b2
+with a residual connection. This version prioritizes clarity and works well when
+the hidden dimension (d_hidden) is small.
 
-    Forward: out = x + delta(x)
-    where delta(x) = Linear(relu(Linear(x)))
+LowRankExpert implements a parameter-efficient alternative:
+    x + γ * V * ϕ(U * x)
+where U and V are low-rank projections and ϕ is a nonlinearity.
+This design uses approximately 2 * d * r parameters.
+
+To meet a parameter budget of O(d^2 / k), set:
+    2 * d * r ≈ d^2 / k  ⇒  r ≈ d / (2k)
+
+This makes LowRankExpert a good fit for edge devices and other
+resource-constrained environments where efficiency matters.
+"""
+
+class DenseSmallMLPExpert(nn.Module):
     """
+    Expert: residual MLP with biases.
+    Implements: E(x) = x + (W2 * ReLU(W1 x + b1) + b2)
 
-    def __init__(self, d_model: int, d_hidden: int):
+    Args:
+      d_model: model dimension (d)
+      d_hidden: hidden dim of the small MLP (d_hidden)
+      bias: whether to use biases (True)
+    """
+    def __init__(self, d_model: int, d_hidden: int, bias: bool = True):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_hidden, bias=False),
-            nn.ReLU(),
-            nn.Linear(d_hidden, d_model, bias=False),
-        )
+        self.d_model = d_model
+        self.d_hidden = d_hidden
+        self.fc1 = nn.Linear(d_model, d_hidden, bias=bias)
+        self.act = nn.ReLU()
+        self.fc2 = nn.Linear(d_hidden, d_model, bias=bias)
+
+        # initialization: small weights to help stability (optional)
+        nn.init.xavier_uniform_(self.fc1.weight, gain=nn.init.calculate_gain('relu'))
+        nn.init.xavier_uniform_(self.fc2.weight)
+        if bias:
+            nn.init.zeros_(self.fc1.bias)
+            nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [N, d]
-        return x + self.net(x)
+        hidden = self.act(self.fc1(x))         # [N, d_hidden]
+        out = self.fc2(hidden)                 # [N, d]
+        return x + out                         # residual
+
+
+class LowRankExpert(nn.Module):
+    """
+    Low-rank residual expert (LoRA-style) for parameter-efficiency.
+    Implements: E(x) = x + gamma * V * phi(U x)
+    Params ~ 2 * d * r where r << d.
+
+    Args:
+      d_model: model dim (d)
+      r: low-rank dimension
+      act: activation (default SiLU for smoothness), can be ReLU
+      gamma_init: initial scale for residual
+    """
+    def __init__(self, d_model: int, r: int, act: Optional[nn.Module] = None, gamma_init: float = 1.0):
+        super().__init__()
+        self.d_model = d_model
+        self.r = r
+        self.U = nn.Linear(d_model, r, bias=False)
+        self.V = nn.Linear(r, d_model, bias=False)
+        self.act = act if act is not None else nn.SiLU()
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init), dtype=torch.float32))
+
+        # init small
+        nn.init.kaiming_uniform_(self.U.weight, nonlinearity='linear')
+        nn.init.kaiming_uniform_(self.V.weight, nonlinearity='linear')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [N, d]
+        s = self.act(self.U(x))          # [N, r]
+        out = self.V(s)                  # [N, d]
+        return x + (self.gamma * out)    # residual scaled
+
+
+# Helper constructor that chooses appropriate d_hidden relative to d and target k
+def choose_dense_hidden(d: int, target_k: Optional[int] = None, d_hidden_override: Optional[int] = None) -> int:
+    """
+    Compute a reasonable d_hidden for DenseSmallMLPExpert such that the expert param
+    count ~ O(d^2 / k) if target_k provided.
+
+    Math:
+      Params_dense = d * d_hidden + d_hidden * d = 2 d d_hidden
+      We want approx 2 d d_hidden ≈ d^2 / k  => d_hidden ≈ d / (2 k)
+    """
+    if d_hidden_override is not None:
+        return d_hidden_override
+    if target_k is None or target_k <= 0:
+        # default small bottleneck
+        return max(4, d // 8)
+    r_est = max(4, d // (2 * max(1, target_k)))
+    return int(r_est)
+
+
+def choose_lowrank_r(d: int, target_k: Optional[int] = None, r_override: Optional[int] = None) -> int:
+    """
+    Choose low-rank r so that params ≈ 2 d r ≈ d^2 / k  => r ≈ d/(2k)
+    """
+    if r_override is not None:
+        return r_override
+    if target_k is None or target_k <= 0:
+        return max(4, d // 16)
+    r_est = max(2, d // (2 * max(1, target_k)))
+    return int(r_est)
 
 
 class GatingNetwork(nn.Module):
@@ -113,6 +206,10 @@ class FlashMoEModel(nn.Module):
         capacity_factor: float = 1.25,
         tau: float = 1.0,
         top_c: Optional[int] = None,
+        expert_type: str = "lowrank",            # 'lowrank' or 'dense'
+        d_hidden_override: Optional[int] = None, # if provided, forces dense hidden dim
+        r_override: Optional[int] = None,        # if provided, forces low-rank r
+        target_k_budget: Optional[int] = None,   # target_k used in O(d^2/k) budget helper
     ):
         super().__init__()
         assert top_k >= 1 and top_k <= num_experts
@@ -129,8 +226,38 @@ class FlashMoEModel(nn.Module):
         # Gating network (Top-C candidates, then Top-K)
         self.gating_network = GatingNetwork(d_model, num_experts, top_k, tau, top_c=top_c)
 
-        # Experts list
-        self.experts = nn.ModuleList([Expert(d_model, d_hidden) for _ in range(num_experts)])
+                # ---------------- Expert factory (flexible) ----------------
+        # New optional args (add to signature): expert_type='lowrank'|'dense',
+        # d_hidden_override=None, r_override=None, target_k_budget=None
+        #
+        # Explanation of args:
+        # - expert_type: 'lowrank' (LoRA-style) or 'dense' (small MLP)
+        # - d_hidden_override: if you want to force dense hidden dim
+        # - r_override: if you want to force low-rank r
+        # - target_k_budget: integer 'k' used in O(d^2/k) budget formulas (optional)
+        #
+        # Example signature (modify __init__ params accordingly):
+        # def __init__(..., d_hidden: int, ..., expert_type: str = 'lowrank',
+        #              d_hidden_override: Optional[int] = None,
+        #              r_override: Optional[int] = None,
+        #              target_k_budget: Optional[int] = None):
+        #
+        # Use the helpers choose_dense_hidden / choose_lowrank_r above.
+
+        if expert_type not in ('lowrank', 'dense'):
+            raise ValueError(f"expert_type must be 'lowrank' or 'dense', got {expert_type}")
+
+        if expert_type == 'dense':
+            # choose dense hidden dim if not explicitly provided
+            chosen_hidden = choose_dense_hidden(d_model, target_k=target_k_budget, d_hidden_override=d_hidden)
+            self.experts = nn.ModuleList(
+                [DenseSmallMLPExpert(d_model, chosen_hidden) for _ in range(num_experts)]
+            )
+        else:  # 'lowrank'
+            chosen_r = choose_lowrank_r(d_model, target_k=target_k_budget, r_override=r_override)
+            self.experts = nn.ModuleList(
+                [LowRankExpert(d_model, chosen_r) for _ in range(num_experts)]
+            )
 
         # Bookkeeping / stats
         # persistent=False so not saved in checkpoints (runtime-only stats)
@@ -368,24 +495,56 @@ class FlashMoEModel(nn.Module):
 
 # --------------------- Smoke test when run directly ---------------------
 if __name__ == "__main__":
+    torch.manual_seed(0)
+
     d_model = 128
     num_experts = 8
     d_hidden = 256
     top_k = 2
-
-    model = FlashMoEModel(d_model=d_model, num_experts=num_experts, d_hidden=d_hidden, top_k=top_k)
-    model.train()
-
     B = 16
-    x = torch.randn(B, d_model)
-    y = model(x)
-    print("output shape:", y.shape)
 
-    # Single training step
+    print("=== Smoke: LowRank experts (default) ===")
+    model_lr = FlashMoEModel(
+        d_model=d_model,
+        num_experts=num_experts,
+        d_hidden=d_hidden,
+        top_k=top_k,
+        expert_type='lowrank',   # explicit, but this is the default in our design
+        r_override=8             # example low-rank size
+    )
+    model_lr.train()
+    x = torch.randn(B, d_model)
+    y = model_lr(x)
+    print("output shape (lowrank):", y.shape)
+    print("example expert param count:", sum(p.numel() for p in model_lr.experts[0].parameters()))
+    # one training step
     target = torch.randn_like(y)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(model_lr.parameters(), lr=1e-3)
     loss = F.mse_loss(y, target)
     opt.zero_grad()
     loss.backward()
     opt.step()
-    print("train step ok; last_overflow_rate=", model.last_overflow_rate.item())
+    print("train step ok; last_overflow_rate (lowrank) =", model_lr.last_overflow_rate.item())
+    print()
+
+    print("=== Smoke: Dense small-MLP experts ===")
+    model_dense = FlashMoEModel(
+        d_model=d_model,
+        num_experts=num_experts,
+        d_hidden=d_hidden,
+        top_k=top_k,
+        expert_type='dense',
+        d_hidden_override=128   # example hidden dim for dense small-MLP expert
+    )
+    model_dense.train()
+    y2 = model_dense(x)  # reuse x to compare deterministically
+    print("output shape (dense):", y2.shape)
+    print("example expert param count (dense):", sum(p.numel() for p in model_dense.experts[0].parameters()))
+    # one training step
+    target2 = torch.randn_like(y2)
+    opt2 = torch.optim.Adam(model_dense.parameters(), lr=1e-3)
+    loss2 = F.mse_loss(y2, target2)
+    opt2.zero_grad()
+    loss2.backward()
+    opt2.step()
+    print("train step ok; last_overflow_rate (dense) =", model_dense.last_overflow_rate.item())
