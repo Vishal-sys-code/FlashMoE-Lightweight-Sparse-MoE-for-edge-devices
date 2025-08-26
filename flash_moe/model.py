@@ -266,229 +266,223 @@ class FlashMoEModel(nn.Module):
 
     # --------------------- Forward ---------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with Top-K routing and vectorized-ish expert dispatch.
+        """
+        Clean, readable FlashMoE forward:
+        - Top-C candidate selection -> Top-K routing (from gating_network)
+        - Vectorized grouping: sort by expert id, pack tokens per-expert
+        - Per-expert batch compute -> scatter weighted residuals back
+        - Capacity clamping per-expert (cap = ceil(capacity_factor * (K * B) / M))
+        - Greedy reroute of overflow tokens using Top-C candidates and probs
+        - Bookkeeping of overflow count / rate
 
-        Args:
-            x: [B, d]
-        Returns:
-            y: [B, d]
+        Notes:
+        - This version tries to minimize expensive device->host copies. We still convert
+            a small number of scalars to Python ints (expert ids) and use Python loops only
+            over active experts or when performing the greedy reroute (B*C entries).
+        - If you expect extremely large B and C, consider replacing the greedy reroute
+          with a purely tensorized assignment or a custom kernel.
         """
         device = x.device
         dtype = x.dtype
         B = x.size(0)
 
-        # Encode input
+        # 1) Encode
         encoded = self.shared_encoder(x)  # [B, d]
 
-        # Gating decisions - returns candidates for reroute and full probs for balancing
-        topk_idx, topk_weights, probs, topc_idx = self.gating_network(encoded)
-        # topk_idx: [B, K], topk_weights: [B, K], topc_idx: [B, C]
+        # 2) Gating: expect (topk_idx, topk_weights, probs, topc_idx)
+        gating_out = self.gating_network(encoded)
+        topk_idx, topk_weights = gating_out[0], gating_out[1]  # [B, K], [B, K]
+        probs = gating_out[2] if len(gating_out) > 2 else None
+        topc_idx = gating_out[3] if len(gating_out) > 3 else None
 
-        # Prepare flattened assignment lists (token index repeated K times)
-        tok_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)  # [B*K]
-        exp_idx = topk_idx.reshape(-1)   # [B*K]
+        # 3) Flatten assignments (token repeated K times)
+        K = topk_idx.size(1)
+        tok_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, K).reshape(-1)  # [B*K]
+        exp_idx = topk_idx.reshape(-1)    # [B*K]
         w_flat = topk_weights.reshape(-1)  # [B*K]
 
-        # Filter tiny weights (guard against numerical zeros)
-        mask = w_flat > 1e-12
-        tok_idx = tok_idx[mask]
-        exp_idx = exp_idx[mask]
-        w_flat = w_flat[mask]
-
-        # If no assignments, return encoded and zero bookkeeping
-        total_assignments = int(self.top_k * B)
-        if exp_idx.numel() == 0:
+        # 4) Filter tiny weights (numerical guard)
+        keep_mask = w_flat > 1e-12
+        if keep_mask.sum() == 0:
+            # nothing routed; update bookkeeping and return encoded
             self.last_overflow_count = torch.tensor(0, device=device)
             self.last_overflow_rate = torch.tensor(0.0, device=device)
             return encoded
 
-        # Sort by expert id so tokens for same expert are contiguous
+        tok_idx = tok_idx[keep_mask]
+        exp_idx = exp_idx[keep_mask]
+        w_flat = w_flat[keep_mask]
+
+        # 5) Sort by expert id so tokens for same expert are contiguous
         order = torch.argsort(exp_idx)
         exp_sorted = exp_idx[order]
         tok_sorted = tok_idx[order]
         w_sorted = w_flat[order]
 
-        # Find group boundaries for each expert (unique consecutive)
+        # 6) Unique consecutive experts and counts (active experts)
         unique_experts, counts = torch.unique_consecutive(exp_sorted, return_counts=True)
+        num_active = unique_experts.size(0)
 
-        # Capacity calculation
+        # 7) Capacity and outputs
         cap = math.ceil(self.capacity_factor * (self.top_k * B) / float(self.num_experts))
-
-        # Initialize output as encoded (residual base)
         y = encoded.clone()
-
         overflow_count = 0
 
-        # We'll iterate over *active* experts only. The number of active experts is typically small.
+        # We'll collect overflow tokens (their original token id and their original top-K weight)
+        overflow_tokens_list = []  # list of (token_idx) to reroute later
+
+        # 8) Process each active expert (pack -> expert forward -> scatter)
         offset = 0
-        # unique_experts is a 1D tensor of active expert ids (ascending)
-        num_active = unique_experts.size(0)
+        # Looping over active experts (typically small)
         for i in range(num_active):
-            expert_id_tensor = unique_experts[i]  # tensor scalar on device
+            expert_id_tensor = unique_experts[i]
             n_tokens = int(counts[i].item())
             start = offset
             end = offset + n_tokens
             offset = end
 
-            # Convert to python int to index ModuleList (cheap: small loop over active experts)
+            # get python int for ModuleList indexing (cheap: few active experts)
             expert_id = int(expert_id_tensor.item())
 
-            tokens_for_e = tok_sorted[start:end]  # indices in [0, B)
-            weights_for_e = w_sorted[start:end]
+            tokens_for_e = tok_sorted[start:end]    # [n_tokens]
+            weights_for_e = w_sorted[start:end]     # [n_tokens] (same device/dtype)
 
-            # Capacity clamp: if overflow, re-route excess tokens to next-best candidates
+            # 9) Capacity clamp: if overflow, keep top-'cap' by weight and collect overflow tokens
             if n_tokens > cap:
                 overflow = n_tokens - cap
                 overflow_count += overflow
 
-                # We want to keep the top-`cap` tokens by weight for this expert.
-                # Keep indices of the kept tokens
-                _, keep_idx = torch.topk(weights_for_e, k=cap, largest=True)
+                # pick top cap by weights_for_e
+                keep_vals, keep_idx = torch.topk(weights_for_e, k=cap, largest=True)
                 keep_idx_sorted, _ = torch.sort(keep_idx)  # preserve order within kept set
                 kept_tokens = tokens_for_e[keep_idx_sorted]
                 kept_weights = weights_for_e[keep_idx_sorted]
 
-                # Determine overflow tokens (those not kept)
+                # compute overflow mask and overflow token indices
                 mask_kept = torch.zeros(n_tokens, dtype=torch.bool, device=device)
                 mask_kept[keep_idx] = True
                 overflow_mask = ~mask_kept
-                overflow_tokens = tokens_for_e[overflow_mask]
-                overflow_weights = weights_for_e[overflow_mask]
+                overflow_tokens = tokens_for_e[overflow_mask]  # tensor of token ids
+                # append overflow tokens to global list for rerouting (we'll use topc/probs)
+                if overflow_tokens.numel() > 0:
+                    overflow_tokens_list.append(overflow_tokens)
 
-                # Assign kept tokens to this expert (pack & compute below)
+                # use kept tokens for computing this expert's outputs
                 tokens_for_e = kept_tokens
                 weights_for_e = kept_weights
+
+                # update n_tokens
                 n_tokens = tokens_for_e.numel()
 
-                # --- REROUTE overflow tokens to next-best candidates from top-C list ---
-                # For each overflow token t, find the next best candidate index (in topc_idx)
-                # that is not the current expert and attempt to assign it there.
-                if overflow_tokens.numel() > 0:
-                    # topc_idx: [B, C] on device
-                    # for each overflow token t we have a candidate list; iterate in python
-                    # (overflow_count small typically). We'll append these rerouted assignments
-                    # to a lists to be processed after main loop.
-                    # To avoid complicated in-loop mutation of sorted arrays, collect reroutes.
-                    # We'll build lists reroute_tokens, reroute_experts, reroute_weights
-                    # Note: weight used for rerouted assignment can be taken from the original
-                    # topC probabilities for that token. We'll use the probs vector to find
-                    # next-best candidate's weight.
-                    # (we use python loop because overflow tokens are expected to be few)
-                    pass  # we handle reroutes after main loop for simplicity
-
-            # Pack inputs for this expert
+            # 10) Pack inputs and run expert if there are tokens
             if n_tokens == 0:
                 continue
-            x_block = encoded[tokens_for_e]  # [n_tokens, d]
 
-            # Compute expert outputs in batch
+            x_block = encoded[tokens_for_e]           # [n_tokens, d]
             expert = self.experts[expert_id]
-            y_block = expert(x_block)  # [n_tokens, d] (includes residual)
+            y_block = expert(x_block)                 # [n_tokens, d] includes residual
+            delta = y_block - x_block                 # [n_tokens, d]
 
-            # Convert to residual form: delta = y_block - x_block
-            delta = y_block - x_block
-
-            # Weighted residual add: y[tokens] += w * delta
+            # Weighted residual add
             y.index_add_(0, tokens_for_e, delta * weights_for_e.unsqueeze(-1))
 
-        # --- Handle reroutes if any overflow occurred ---
-        # For simplicity and determinism: compute reroutes in a separate pass using top-C candidates.
-        # Build reroute assignment lists
+        # 11) If overflow happened, perform greedy reroute using Top-C candidates (if available)
         if overflow_count > 0:
-            reroute_tok_list = []
-            reroute_exp_list = []
-            reroute_weight_list = []
+            if topc_idx is None or probs is None:
+                # No reroute info available: we cannot reroute; just record overflow and return
+                # (alternatively you could drop tokens silently — this is a design choice)
+                self.last_overflow_count = torch.tensor(overflow_count, device=device)
+                self.last_overflow_rate = torch.tensor(float(overflow_count) / max(1.0, self.top_k * B), device=device)
+                return y
 
-            # Reconstruct assignments to search for overflow tokens:
-            # For each token t, check how many times it was assigned originally and whether it
-            # was kept for that expert. If any overflow tokens exist, reassign them to next best.
-            # Simpler approach: iterate tokens and check their assigned experts from topk_idx and whether
-            # they ended up in final output (we know y was updated for kept tokens). Because we didn't
-            # store a direct mask of kept tokens per expert, we'll recompute per-token reserved slot counts:
-            # For each token t: scan its top-K candidates and weights; for the first candidate that still
-            # has capacity available (we recompute remaining slots per expert), assign token there.
-            #
-            # This is more straightforward: compute remaining capacities per expert and fill them by
-            # scanning tokens in decreasing order of their topk weight.
-            remaining_cap = torch.full((self.num_experts,), cap, dtype=torch.long, device=device)
-            # Deduct what we've already assigned (quick scan over unique_experts counts kept)
-            offset = 0
-            for i in range(num_active):
-                expert_id = int(unique_experts[i].item())
-                assigned = int(counts[i].item())
-                # Some of these were overflowed and not actually assigned; approximate by min(assigned, cap)
-                assigned_kept = min(assigned, cap)
-                remaining_cap[expert_id] = max(0, cap - assigned_kept)
+            # Build a single tensor of all overflow token ids (concatenate collected tensors)
+            if len(overflow_tokens_list) > 0:
+                overflow_tokens_all = torch.cat(overflow_tokens_list, dim=0)  # [N_overflow]
+            else:
+                overflow_tokens_all = torch.empty((0,), dtype=torch.long, device=device)
 
-            # Build a list of candidate assignment tuples (token, candidate_expert, weight) for all tokens,
-            # sorted by decreasing weight so high-weight tokens get priority to fill remaining slots.
-            # We'll consider each token's candidates in order provided by topc_idx and use probs to set weights.
-            B_range = torch.arange(B, device=device)
-            # For each token, get candidate experts and their probs
-            topc = topc_idx  # [B, C]
-            # Use the precomputed probs (softmax over all experts) to get candidate weights
-            # Extract candidate probs by gather
-            topc_probs = torch.gather(probs, 1, topc)  # [B, C]
+            # If no overflow tokens, nothing to reroute
+            if overflow_tokens_all.numel() > 0:
+                # Remaining capacity per expert: start with cap and subtract how many were kept/assigned
+                remaining_cap = torch.full((self.num_experts,), cap, dtype=torch.long, device=device)
 
-            # Create flattened candidate list (B*C entries)
-            token_vals = B_range.unsqueeze(1).expand(-1, topc.size(1)).reshape(-1)  # [B*C]
-            cand_exps = topc.reshape(-1)  # [B*C]
-            cand_weights = topc_probs.reshape(-1)  # [B*C]
+                # Subtract assigned tokens per active expert: assigned_kept = min(counts, cap)
+                offset = 0
+                for i in range(num_active):
+                    eid = int(unique_experts[i].item())
+                    assigned_raw = int(counts[i].item())
+                    assigned_kept = min(assigned_raw, cap)
+                    remaining_cap[eid] = max(0, remaining_cap[eid] - assigned_kept)
 
-            # Filter out candidates that correspond to experts that already have full capacity
-            # But we want to fill slots fairly: sort all candidate entries by weight descending and assign greedily.
-            order_cand = torch.argsort(cand_weights, descending=True)
-            token_vals = token_vals[order_cand]
-            cand_exps = cand_exps[order_cand]
-            cand_weights = cand_weights[order_cand]
+                # Build candidate triplets for greedy assignment:
+                # For each token t in overflow_tokens_all, consider its top-C candidates from topc_idx
+                # and their probs (from probs tensor); we'll flatten them and sort by weight desc.
+                N_over = int(overflow_tokens_all.numel())
+                C = topc_idx.size(1)
+                # token indices repeated C times -> shape [N_over * C]
+                token_expand = overflow_tokens_all.unsqueeze(1).expand(-1, C).reshape(-1)  # [N_over*C]
+                # candidate expert ids for those tokens
+                cand_exps = torch.gather(topc_idx, 0, token_expand.unsqueeze(1)).reshape(-1)  # [N_over*C]
+                # candidate weights from probs
+                cand_weights = torch.gather(probs, 1, cand_exps.view(N_over, C)).reshape(-1)  # [N_over*C]
 
-            # Track which tokens already assigned in reroute pass
-            token_assigned_mask = torch.zeros(B, dtype=torch.bool, device=device)
+                # sort candidates by weight descending
+                cand_order = torch.argsort(cand_weights, descending=True)
+                token_expand = token_expand[cand_order]
+                cand_exps = cand_exps[cand_order]
+                cand_weights = cand_weights[cand_order]
 
-            for t_val, e_val, w_val in zip(token_vals.tolist(), cand_exps.tolist(), cand_weights.tolist()):
-                if token_assigned_mask[t_val]:
-                    continue
-                e_int = int(e_val)
-                if remaining_cap[e_int].item() <= 0:
-                    continue
-                # Assign token t_val to expert e_int
-                token_assigned_mask[t_val] = True
-                remaining_cap[e_int] -= 1
-                reroute_tok_list.append(t_val)
-                reroute_exp_list.append(e_int)
-                reroute_weight_list.append(float(w_val))
+                # Greedy assign: iterate over candidates and fill remaining_cap; avoid repeating tokens
+                token_assigned_mask = torch.zeros(B, dtype=torch.bool, device=device)
+                # We'll collect reroute assignments per-expert to compute in grouped batched fashion
+                reroute_tok_list = []
+                reroute_exp_list = []
+                reroute_w_list = []
 
-            # Now perform grouped compute for reroutes by grouping reroute lists per expert
-            if len(reroute_tok_list) > 0:
-                reroute_tok_tensor = torch.tensor(reroute_tok_list, dtype=torch.long, device=device)
-                reroute_exp_tensor = torch.tensor(reroute_exp_list, dtype=torch.long, device=device)
-                reroute_w_tensor = torch.tensor(reroute_weight_list, dtype=dtype, device=device)
+                # iterate (we must use python-level loop here over candidate list; this is usually fine)
+                for t_val, e_val, w_val in zip(token_expand.tolist(), cand_exps.tolist(), cand_weights.tolist()):
+                    if token_assigned_mask[t_val]:
+                        continue
+                    e_int = int(e_val)
+                    if remaining_cap[e_int].item() <= 0:
+                        continue
+                    # assign token to expert e_int
+                    token_assigned_mask[t_val] = True
+                    remaining_cap[e_int] -= 1
+                    reroute_tok_list.append(t_val)
+                    reroute_exp_list.append(e_int)
+                    reroute_w_list.append(float(w_val))
 
-                # Sort by expert id to group
-                order_r = torch.argsort(reroute_exp_tensor)
-                reroute_exp_sorted = reroute_exp_tensor[order_r]
-                reroute_tok_sorted = reroute_tok_tensor[order_r]
-                reroute_w_sorted = reroute_w_tensor[order_r]
+                # Now perform grouped compute for reroutes (pack per expert)
+                if len(reroute_tok_list) > 0:
+                    reroute_tok_tensor = torch.tensor(reroute_tok_list, dtype=torch.long, device=device)
+                    reroute_exp_tensor = torch.tensor(reroute_exp_list, dtype=torch.long, device=device)
+                    reroute_w_tensor = torch.tensor(reroute_w_list, dtype=dtype, device=device)
 
-                unique_r_exps, r_counts = torch.unique_consecutive(reroute_exp_sorted, return_counts=True)
-                off = 0
-                for i in range(unique_r_exps.numel()):
-                    rid = int(unique_r_exps[i].item())
-                    cnt = int(r_counts[i].item())
-                    s = off
-                    e = off + cnt
-                    off = e
-                    toks = reroute_tok_sorted[s:e]
-                    ws = reroute_w_sorted[s:e]
-                    x_block = encoded[toks]
-                    expert = self.experts[rid]
-                    y_block = expert(x_block)
-                    delta = y_block - x_block
-                    y.index_add_(0, toks, delta * ws.unsqueeze(-1))
+                    order_r = torch.argsort(reroute_exp_tensor)
+                    reroute_exp_sorted = reroute_exp_tensor[order_r]
+                    reroute_tok_sorted = reroute_tok_tensor[order_r]
+                    reroute_w_sorted = reroute_w_tensor[order_r]
 
-        # Bookkeeping: store last overflow rate and count
+                    unique_r_exps, r_counts = torch.unique_consecutive(reroute_exp_sorted, return_counts=True)
+                    off = 0
+                    for i in range(unique_r_exps.numel()):
+                        rid = int(unique_r_exps[i].item())
+                        cnt = int(r_counts[i].item())
+                        s = off
+                        e = off + cnt
+                        off = e
+                        toks = reroute_tok_sorted[s:e]
+                        ws = reroute_w_sorted[s:e]
+                        x_block = encoded[toks]
+                        expert = self.experts[rid]
+                        y_block = expert(x_block)
+                        delta = y_block - x_block
+                        y.index_add_(0, toks, delta * ws.unsqueeze(-1))
+
+        # 12) Bookkeeping and return
         self.last_overflow_count = torch.tensor(overflow_count, device=device)
-        self.last_overflow_rate = torch.tensor(float(overflow_count) / max(1.0, total_assignments), device=device)
+        self.last_overflow_rate = torch.tensor(float(overflow_count) / max(1.0, self.top_k * B), device=device)
 
         return y
 
