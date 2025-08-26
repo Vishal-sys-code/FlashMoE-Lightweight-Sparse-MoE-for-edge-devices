@@ -476,56 +476,80 @@ class FlashMoEModel(nn.Module):
         return y
 
 
-# ---------------- Smoke test ----------------
-if __name__ == "__main__":
-    torch.manual_seed(0)
+    # ---------------- Training objective helpers ----------------
+    def compute_loss(self,
+                     y: torch.Tensor,
+                     target: torch.Tensor,
+                     info: Optional[dict] = None,
+                     loss_type: str = "mse",
+                     lambda_bal: float = 1e-3,
+                     drop_penalty: Optional[float] = None) -> Tuple[torch.Tensor, dict]:
+        """
+        Compute training loss components and total:
+          L_task + lambda_bal * L_balance + optional drop_penalty * drop_frac
 
-    d_model = 128
-    num_experts = 8
-    d_hidden = 256
-    top_k = 2
-    B = 16
+        Args:
+          y: model outputs [B, d] (for 'mse') or logits [B, C] (for 'cross_entropy')
+          target: target tensor (same shape as y for mse, long labels for cross_entropy)
+          info: routing info dict with keys 'probs','topk_idx','topk_weights' (if None, load-balance term = 0)
+          loss_type: 'mse' or 'cross_entropy'
+          lambda_bal: weight for load-balance loss
+          drop_penalty: optional scalar weight for drop penalty (uses model.last_dropped_count)
 
-    print("=== Smoke: LowRank experts (default) ===")
-    model_lr = FlashMoEModel(
-        d_model=d_model,
-        num_experts=num_experts,
-        d_hidden=d_hidden,
-        top_k=top_k,
-        expert_type="lowrank",
-        r_override=8,
-    )
-    model_lr.train()
-    x = torch.randn(B, d_model)
-    y = model_lr(x)
-    print("output shape (lowrank):", y.shape)
-    print("example expert param count:", sum(p.numel() for p in model_lr.experts[0].parameters()))
-    target = torch.randn_like(y)
-    opt = torch.optim.Adam(model_lr.parameters(), lr=1e-3)
-    loss = F.mse_loss(y, target)
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-    print("train step ok; last_overflow_rate (lowrank) =", model_lr.last_overflow_rate.item())
-    print()
+        Returns:
+          (total_loss, components) where components is a dict: {'L_task':..., 'L_bal':..., 'L_drop':...}
+        """
+        # Task loss
+        if loss_type == "mse":
+            L_task = F.mse_loss(y, target)
+        elif loss_type == "cross_entropy":
+            # expects target: LongTensor of labels
+            L_task = F.cross_entropy(y, target)
+        else:
+            raise ValueError("loss_type must be 'mse' or 'cross_entropy'")
 
-    print("=== Smoke: Dense small-MLP experts ===")
-    model_dense = FlashMoEModel(
-        d_model=d_model,
-        num_experts=num_experts,
-        d_hidden=d_hidden,
-        top_k=top_k,
-        expert_type="dense",
-        d_hidden_override=128,
-    )
-    model_dense.train()
-    y2 = model_dense(x)
-    print("output shape (dense):", y2.shape)
-    print("example expert param count (dense):", sum(p.numel() for p in model_dense.experts[0].parameters()))
-    target2 = torch.randn_like(y2)
-    opt2 = torch.optim.Adam(model_dense.parameters(), lr=1e-3)
-    loss2 = F.mse_loss(y2, target2)
-    opt2.zero_grad()
-    loss2.backward()
-    opt2.step()
-    print("train step ok; last_overflow_rate (dense) =", model_dense.last_overflow_rate.item())
+        # Load-balance loss
+        if info is not None and "probs" in info and "topk_idx" in info and "topk_weights" in info:
+            L_bal = load_balance_loss(info["probs"], info["topk_idx"], info["topk_weights"], self.num_experts)
+        else:
+            L_bal = torch.tensor(0.0, device=y.device, dtype=y.dtype)
+
+        # Drop penalty (fraction of tokens dropped)
+        if drop_penalty is None:
+            if self.drop_penalty is not None:
+                drop_penalty = float(self.drop_penalty)
+            else:
+                drop_penalty = 0.0
+
+        L_drop = torch.tensor(0.0, device=y.device, dtype=y.dtype)
+        if drop_penalty is not None and drop_penalty > 0.0:
+            # last_dropped_count is num tokens dropped (unique tokens); normalize by batch size
+            B = y.size(0)
+            drop_frac = float(self.last_dropped_count.item()) / max(1.0, float(B))
+            L_drop = torch.tensor(drop_penalty * drop_frac, device=y.device, dtype=y.dtype)
+
+        total = L_task + float(lambda_bal) * L_bal + L_drop
+        components = {"L_task": L_task.detach() if isinstance(L_task, torch.Tensor) else L_task,
+                      "L_bal": L_bal.detach() if isinstance(L_bal, torch.Tensor) else L_bal,
+                      "L_drop": L_drop.detach() if isinstance(L_drop, torch.Tensor) else L_drop}
+        return total, components
+
+
+    def training_step(self,
+                      x: torch.Tensor,
+                      target: torch.Tensor,
+                      optimizer: torch.optim.Optimizer,
+                      loss_type: str = "mse",
+                      lambda_bal: float = 1e-3,
+                      drop_penalty: Optional[float] = None) -> Tuple[torch.Tensor, dict]:
+        """
+        Convenience helper that runs a forward, computes the training objective,
+        backprops, and takes an optimizer step. Returns (total_loss, components).
+        """
+        self.train()
+        optimizer.zero_grad()
+        y, info = self(x, return_router_info=True)
+        total, comps = self.compute_loss(y, target, info=info, loss_type=loss_type, lambda_bal=lambda_bal, drop_penalty=drop_penalty)
+        total.backward()
+        optimizer.step()
+        return total.detach(), comps
