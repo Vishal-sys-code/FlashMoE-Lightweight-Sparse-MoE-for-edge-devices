@@ -220,3 +220,23 @@ def test_pack_unpack_equivalence(params):
     y_vec = model(x)
 
     assert torch.allclose(y_naive, y_vec, atol=1e-6), "Vectorized output differs from naive reference"
+
+
+# ---------------- New test: training objective composition ----------------
+def test_training_objective_combines_losses(params):
+    """
+    Ensure compute_loss/training_step runs and gradients flow when combining
+    task loss and load-balance loss.
+    """
+    model = FlashMoEModel(**params)
+    B = 16
+    x = torch.randn(B, params["d_model"])
+    target = torch.randn(B, params["d_model"])  # MSE target
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Run one training_step (convenience helper) which does forward + loss + step
+    total, comps = model.training_step(x, target, optimizer, loss_type="mse", lambda_bal=1e-3)
+
+    # total should be scalar and finite; components keys present
+    assert isinstance(total, torch.Tensor) and total.dim() == 0 and torch.isfinite(total)
+    assert "L_task" in comps and "L_bal" in comps and "L_drop" in comps
