@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local artifacts and data
+artifacts/
+*.log
+*.csv
+*.pt
+*.onnx
+
+# IDE files
+.idea/
+.vscode/
