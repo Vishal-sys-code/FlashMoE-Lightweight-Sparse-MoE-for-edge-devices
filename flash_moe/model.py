@@ -81,67 +81,13 @@ class DenseSmallMLPExpert(nn.Module):
             out = out + self.adapter_V(self.adapter_U(x))
             return x + out
         # training path with checkpoint (keep for memory)
-        return checkpoint(self._dense_forward, x)
+        return checkpoint(self._dense_forward, x, use_reentrant=False)
 
-        # ---------------- export-safe forward (traceable) ----------------
     def forward_export(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Export-safe forward:
-        - deterministic, no Python branch on tensors
-        - uses Top-K routing but does NOT perform capacity clamping/reroute
-        - groups tokens per expert and calls expert.forward_export when available
-          to avoid hitting checkpoint() during tracing.
+        Export-safe forward: no checkpoint, pure tensor ops.
         """
-        device = x.device
-        B = x.size(0)
-        K = self.top_k
-
-        encoded = self.shared_encoder(x)  # [B, d]
-        topk_idx, topk_weights, probs, topc_idx = self.gating_network(encoded)  # tensors only
-
-        tok_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, K).reshape(-1)  # [B*K]
-        exp_idx = topk_idx.reshape(-1)  # [B*K]
-        w_flat = topk_weights.reshape(-1)  # [B*K]
-
-        mask = w_flat > 1e-12
-        tok_idx = tok_idx[mask]
-        exp_idx = exp_idx[mask]
-        w_flat = w_flat[mask]
-
-        # if nothing to dispatch, return encoded
-        if exp_idx.numel() == 0:
-            return encoded
-
-        # sort by expert id so tokens for same expert are contiguous
-        order = torch.argsort(exp_idx)
-        exp_sorted = exp_idx[order]
-        tok_sorted = tok_idx[order]
-        w_sorted = w_flat[order]
-
-        y = encoded.clone()
-
-        # iterate fixed-range over experts (python int). This is fine for tracing.
-        for e in range(self.num_experts):
-            matches = exp_sorted == e  # boolean tensor
-            pos = torch.nonzero(matches, as_tuple=False).reshape(-1)
-            if pos.numel() == 0:
-                continue
-            toks = tok_sorted[pos]
-            ws = w_sorted[pos]
-            xb = encoded[toks]
-
-            expert = self.experts[e]
-            # prefer export-safe entrypoint if available (no checkpoint)
-            if hasattr(expert, "forward_export"):
-                yb = expert.forward_export(xb)
-            else:
-                # fallback (may call checkpoint; undesirable for tracing but kept as a last resort)
-                yb = expert(xb)
-
-            delta = yb - xb
-            y.index_add_(0, toks, delta * ws.unsqueeze(-1))
-
-        return y
+        return self._dense_forward(x)
 
 
 
@@ -174,7 +120,7 @@ class LowRankExpert(nn.Module):
             out = F.linear(s, V_dq, None)
             return x + self.gamma * out
         # training path with checkpoint
-        return checkpoint(self._lowrank_forward, x)
+        return checkpoint(self._lowrank_forward, x, use_reentrant=False)
 
     def forward_export(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -305,6 +251,9 @@ class FlashMoEModel(nn.Module):
         else:
             chosen_r = choose_lowrank_r(d_model, target_k=target_k_budget, r_override=r_override)
             self.experts = nn.ModuleList([LowRankExpert(d_model, chosen_r, use_quant=self.use_quant) for _ in range(num_experts)])
+
+        for expert in self.experts:
+            assert hasattr(expert, 'forward_export'), f"Expert {expert.__class__.__name__} is missing a forward_export method"
 
         self.register_buffer("last_overflow_rate", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_overflow_count", torch.tensor(0, dtype=torch.long), persistent=False)
@@ -501,9 +450,10 @@ class FlashMoEModel(nn.Module):
     def forward_export(self, x: torch.Tensor) -> torch.Tensor:
         """
         Export-safe forward:
-        - deterministic, no Python branch on tensors
+        - deterministic, minimal python/tensor conversions for tracing
         - uses Top-K routing but does NOT perform capacity clamping/reroute
-        - vectorized grouping by expert (loops over fixed num_experts)
+        - groups tokens per active expert (fewer Python branches) and calls
+          expert.forward_export which must not use checkpoint()
         """
         device = x.device
         B = x.size(0)
@@ -521,10 +471,11 @@ class FlashMoEModel(nn.Module):
         exp_idx = exp_idx[mask]
         w_flat = w_flat[mask]
 
-        # sort by expert id so tokens per expert are contiguous
+        # if nothing to dispatch, quick return
         if exp_idx.numel() == 0:
             return encoded
 
+        # sort by expert id so tokens for same expert are contiguous
         order = torch.argsort(exp_idx)
         exp_sorted = exp_idx[order]
         tok_sorted = tok_idx[order]
@@ -532,23 +483,37 @@ class FlashMoEModel(nn.Module):
 
         y = encoded.clone()
 
-        # For exportability we avoid data-dependent python branching on tensors:
-        # iterate fixed-range over experts (python int)
-        for e in range(self.num_experts):
-            # find positions where exp_sorted == e
-            matches = exp_sorted == e  # boolean tensor
-            # get indices of matches in exp_sorted
+        # Only iterate over *active* experts present in exp_sorted
+        active_experts = torch.unique(exp_sorted)  # 0-dim/1-dim tensor of expert ids (may be empty)
+
+        # If no active experts (defensive), return encoded
+        if active_experts.numel() == 0:
+            return encoded
+
+        # Iterate over active experts (small list) and process grouped tokens
+        for e_tensor in active_experts:
+            e = int(e_tensor.item())  # convert single tensor to python int (small overhead)
+            # get positions of this expert in the sorted lists
+            matches = exp_sorted == e
             pos = torch.nonzero(matches, as_tuple=False).reshape(-1)
+            # pos could be empty (defensive)
             if pos.numel() == 0:
                 continue
             toks = tok_sorted[pos]
             ws = w_sorted[pos]
             xb = encoded[toks]
-            yb = self.experts[e](xb)
+
+            expert = self.experts[e]
+            # require export-safe expert method to avoid checkpoint in trace
+            if not hasattr(expert, "forward_export"):
+                raise RuntimeError(f"Expert {e} missing 'forward_export' required for export/tracing.")
+            yb = expert.forward_export(xb)
+
             delta = yb - xb
             y.index_add_(0, toks, delta * ws.unsqueeze(-1))
 
         return y
+
 
     # ---------------- Training objective helpers ----------------
     def compute_loss(self,
