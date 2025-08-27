@@ -1,0 +1,11 @@
+torch
+torchtext
+datasets
+transformers
+huggingface-hub
+psutil
+numpy
+pandas
+scipy
+onnx
+onnxruntime
