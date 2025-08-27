@@ -11,31 +11,39 @@ from scripts.data import get_wikitext2_data
 from scripts.model import create_model
 from scripts.utils import set_seed, setup_logging, MetricsLogger
 
-def train_one_epoch(model, data_loader, optimizer, criterion, device, grad_clip=1.0):
+# inside wikitext2_train.py
+
+def train_one_epoch(model, data_loader, optimizer, criterion, device, grad_clip=1.0, lambda_bal=1e-3, debug=False):
     model.train()
     total_loss = 0.
     start_time = time.time()
-    
-    for inputs, targets in data_loader:
+
+    for step, (inputs, targets) in enumerate(data_loader, 1):
         inputs, targets = inputs.to(device), targets.to(device)
-        
+
         optimizer.zero_grad()
-        
-        outputs, aux_loss, _ = model(inputs)
-        
-        # Reshape for loss calculation
+
+        outputs, aux_loss, _ = model(inputs)  # outputs: [B, T, V], aux_loss: scalar tensor
         outputs_flat = outputs.view(-1, outputs.size(-1))
         targets_flat = targets.view(-1)
-        
+
         main_loss = criterion(outputs_flat, targets_flat)
-        total_epoch_loss = main_loss + aux_loss
-        
+        # scale balancing loss (lambda hyperparam)
+        total_epoch_loss = main_loss + (lambda_bal * aux_loss)
+
         total_epoch_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-        
+
         total_loss += main_loss.item()
-        
+
+        if debug and (step % 50 == 0):
+            # quick debug prints to sanity-check shapes/gradients
+            print(f"[debug] step {step} main_loss={main_loss.item():.6f} aux_loss={aux_loss.item():.6f}")
+            grads = [p.grad.norm().item() for p in model.parameters() if p.grad is not None]
+            if grads:
+                print(f"[debug] grad_norms min/max = {min(grads):.6e}/{max(grads):.6e}")
+
     avg_loss = total_loss / len(data_loader)
     elapsed = time.time() - start_time
     return avg_loss, elapsed
@@ -74,7 +82,13 @@ def main(args):
     )
     
     # Model
+     # Model
     model = create_model(args, tokenizer).to(device)
+    # Weight tying: share embedding and decoder weights (improves LM)
+    try:
+        model.decoder.weight = model.embedding.weight
+    except Exception:
+        pass
     logging.info(f"Model created. Number of parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     
     # Optimizer and Scheduler
@@ -86,7 +100,7 @@ def main(args):
     for epoch in range(1, args.epochs + 1):
         epoch_start_time = time.time()
         
-        train_loss, train_elapsed = train_one_epoch(model, train_loader, optimizer, criterion, device, args.grad_clip)
+        train_loss, train_elapsed = train_one_epoch(model, train_loader, optimizer, criterion, device, args.grad_clip, lambda_bal=args.load_balancing_lambda, debug=args.debug)
         val_loss, val_ppl = evaluate(model, val_loader, criterion, device)
         
         scheduler.step()
