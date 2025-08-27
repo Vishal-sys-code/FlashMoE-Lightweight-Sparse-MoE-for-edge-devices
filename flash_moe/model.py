@@ -1,54 +1,27 @@
 # flash_moe/model.py
+import os
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Iterable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
-# ---------------- Experts ----------------
-class DenseSmallMLPExpert(nn.Module):
-    """Dense small MLP expert: E(x) = x + W2(ReLU(W1 x + b1)) + b2 (residual)."""
-
-    def __init__(self, d_model: int, d_hidden: int, bias: bool = True):
-        super().__init__()
-        self.fc1 = nn.Linear(d_model, d_hidden, bias=bias)
-        self.act = nn.ReLU()
-        self.fc2 = nn.Linear(d_hidden, d_model, bias=bias)
-
-        nn.init.xavier_uniform_(self.fc1.weight, gain=nn.init.calculate_gain("relu"))
-        nn.init.xavier_uniform_(self.fc2.weight)
-        if bias:
-            nn.init.zeros_(self.fc1.bias)
-            nn.init.zeros_(self.fc2.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.act(self.fc1(x))
-        out = self.fc2(h)
-        return x + out
+# ---------------- Quantization helpers ----------------
+def quantize_tensor(t: torch.Tensor):
+    max_val = float(t.abs().max().clamp_min(1e-8))
+    scale = max_val / 127.0
+    q = torch.quantize_per_tensor(t, scale=scale, zero_point=0, dtype=torch.qint8)
+    return q
 
 
-class LowRankExpert(nn.Module):
-    """Low-rank residual expert: E(x) = x + gamma * V(phi(U x))."""
-
-    def __init__(self, d_model: int, r: int, act: Optional[nn.Module] = None, gamma_init: float = 1.0):
-        super().__init__()
-        self.U = nn.Linear(d_model, r, bias=False)
-        self.V = nn.Linear(r, d_model, bias=False)
-        self.act = act if act is not None else nn.SiLU()
-        self.gamma = nn.Parameter(torch.tensor(float(gamma_init), dtype=torch.float32))
-
-        nn.init.kaiming_uniform_(self.U.weight, nonlinearity="linear")
-        nn.init.kaiming_uniform_(self.V.weight, nonlinearity="linear")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s = self.act(self.U(x))
-        out = self.V(s)
-        return x + (self.gamma * out)
+def dequantize_tensor(q: torch.Tensor) -> torch.Tensor:
+    return q.dequantize()
 
 
-# ---------------- Helpers for choosing sizes ----------------
+# ---------------- Helpers for expert size choices ----------------
 def choose_dense_hidden(d: int, target_k: Optional[int] = None, d_hidden_override: Optional[int] = None) -> int:
     if d_hidden_override is not None:
         return int(d_hidden_override)
@@ -65,16 +38,165 @@ def choose_lowrank_r(d: int, target_k: Optional[int] = None, r_override: Optiona
     return max(2, int(d // (2 * max(1, target_k))))
 
 
-# ---------------- Gating network ----------------
-class GatingNetwork(nn.Module):
-    """
-    Gating network: returns (topk_idx, topk_weights, probs, topc_idx)
-      - topk_idx: [B, K] int64
-      - topk_weights: [B, K] float (masked softmax)
-      - probs: [B, M] full softmax over all experts (scaled by tau)
-      - topc_idx: [B, C] candidate list for reroute
-    """
+# ---------------- Expert implementations ----------------
+class DenseSmallMLPExpert(nn.Module):
+    """Dense small MLP expert with optional low-rank adapter and optional quantized-eval path."""
 
+    def __init__(self, d_model: int, d_hidden: int, bias: bool = True, use_quant: bool = False):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_hidden, bias=bias)
+        self.act = nn.ReLU()
+        self.fc2 = nn.Linear(d_hidden, d_model, bias=bias)
+
+        # small rank-decomposed adapter (per-expert)
+        rank = max(4, d_model // 32)
+        self.adapter_U = nn.Linear(d_model, rank, bias=False)
+        self.adapter_V = nn.Linear(rank, d_model, bias=False)
+
+        self.use_quant = bool(use_quant)
+
+        nn.init.xavier_uniform_(self.fc1.weight, gain=nn.init.calculate_gain("relu"))
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.kaiming_uniform_(self.adapter_U.weight, nonlinearity="linear")
+        nn.init.kaiming_uniform_(self.adapter_V.weight, nonlinearity="linear")
+
+    def _dense_forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.fc1(x))
+        out = self.fc2(h)
+        out = out + self.adapter_V(self.adapter_U(x))
+        return x + out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # training path uses checkpoint for memory savings
+        if self.use_quant and not self.training:
+            # eval quant path (dequantize locally, no param mutation)
+            w1_q = quantize_tensor(self.fc1.weight)
+            w2_q = quantize_tensor(self.fc2.weight)
+            w1 = dequantize_tensor(w1_q)
+            w2 = dequantize_tensor(w2_q)
+            b1 = self.fc1.bias.detach() if self.fc1.bias is not None else None
+            b2 = self.fc2.bias.detach() if self.fc2.bias is not None else None
+            h = F.relu(F.linear(x, w1, b1))
+            out = F.linear(h, w2, b2)
+            out = out + self.adapter_V(self.adapter_U(x))
+            return x + out
+        # training path with checkpoint (keep for memory)
+        return checkpoint(self._dense_forward, x)
+
+        # ---------------- export-safe forward (traceable) ----------------
+    def forward_export(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Export-safe forward:
+        - deterministic, no Python branch on tensors
+        - uses Top-K routing but does NOT perform capacity clamping/reroute
+        - groups tokens per expert and calls expert.forward_export when available
+          to avoid hitting checkpoint() during tracing.
+        """
+        device = x.device
+        B = x.size(0)
+        K = self.top_k
+
+        encoded = self.shared_encoder(x)  # [B, d]
+        topk_idx, topk_weights, probs, topc_idx = self.gating_network(encoded)  # tensors only
+
+        tok_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, K).reshape(-1)  # [B*K]
+        exp_idx = topk_idx.reshape(-1)  # [B*K]
+        w_flat = topk_weights.reshape(-1)  # [B*K]
+
+        mask = w_flat > 1e-12
+        tok_idx = tok_idx[mask]
+        exp_idx = exp_idx[mask]
+        w_flat = w_flat[mask]
+
+        # if nothing to dispatch, return encoded
+        if exp_idx.numel() == 0:
+            return encoded
+
+        # sort by expert id so tokens for same expert are contiguous
+        order = torch.argsort(exp_idx)
+        exp_sorted = exp_idx[order]
+        tok_sorted = tok_idx[order]
+        w_sorted = w_flat[order]
+
+        y = encoded.clone()
+
+        # iterate fixed-range over experts (python int). This is fine for tracing.
+        for e in range(self.num_experts):
+            matches = exp_sorted == e  # boolean tensor
+            pos = torch.nonzero(matches, as_tuple=False).reshape(-1)
+            if pos.numel() == 0:
+                continue
+            toks = tok_sorted[pos]
+            ws = w_sorted[pos]
+            xb = encoded[toks]
+
+            expert = self.experts[e]
+            # prefer export-safe entrypoint if available (no checkpoint)
+            if hasattr(expert, "forward_export"):
+                yb = expert.forward_export(xb)
+            else:
+                # fallback (may call checkpoint; undesirable for tracing but kept as a last resort)
+                yb = expert(xb)
+
+            delta = yb - xb
+            y.index_add_(0, toks, delta * ws.unsqueeze(-1))
+
+        return y
+
+
+
+class LowRankExpert(nn.Module):
+    """Low-rank expert (LoRA-style) with optional quantized-eval path."""
+
+    def __init__(self, d_model: int, r: int, act: Optional[nn.Module] = None, use_quant: bool = False):
+        super().__init__()
+        self.U = nn.Linear(d_model, r, bias=False)
+        self.V = nn.Linear(r, d_model, bias=False)
+        self.act = act if act is not None else nn.SiLU()
+        self.gamma = nn.Parameter(torch.tensor(1.0))
+        self.use_quant = bool(use_quant)
+
+        nn.init.kaiming_uniform_(self.U.weight, nonlinearity="linear")
+        nn.init.kaiming_uniform_(self.V.weight, nonlinearity="linear")
+
+    def _lowrank_forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = self.act(self.U(x))
+        out = self.V(s)
+        return x + self.gamma * out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_quant and not self.training:
+            qU = quantize_tensor(self.U.weight)
+            qV = quantize_tensor(self.V.weight)
+            U_dq = dequantize_tensor(qU)
+            V_dq = dequantize_tensor(qV)
+            s = self.act(F.linear(x, U_dq, None))
+            out = F.linear(s, V_dq, None)
+            return x + self.gamma * out
+        # training path with checkpoint
+        return checkpoint(self._lowrank_forward, x)
+
+    def forward_export(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Export-safe forward: no checkpoint, pure tensor ops.
+        """
+        if self.use_quant and not self.training:
+            qU = quantize_tensor(self.U.weight)
+            qV = quantize_tensor(self.V.weight)
+            U_dq = dequantize_tensor(qU)
+            V_dq = dequantize_tensor(qV)
+            s = self.act(F.linear(x, U_dq, None))
+            out = F.linear(s, V_dq, None)
+            return x + self.gamma * out
+
+        s = self.act(self.U(x))
+        out = self.V(s)
+        return x + self.gamma * out
+
+
+
+# ---------------- Gating network (with eval cache) ----------------
+class GatingNetwork(nn.Module):
     def __init__(self, d_model: int, num_experts: int, top_k: int, tau: float = 1.0, top_c: Optional[int] = None):
         super().__init__()
         self.d_model = d_model
@@ -82,79 +204,55 @@ class GatingNetwork(nn.Module):
         self.top_k = top_k
         self.tau = tau
         self.top_c = top_c if top_c is not None else min(num_experts, max(4, 2 * top_k))
-        self.gating_network = nn.Linear(d_model, num_experts, bias=False)
+        self.gating = nn.Linear(d_model, num_experts, bias=False)
+        self._cache: Dict[Tuple[int, str], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     @staticmethod
-    def _stable_softmax(values: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        vmax = values.max(dim=dim, keepdim=True).values
-        e = (values - vmax).exp()
+    def _stable_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        m = x.max(dim=dim, keepdim=True).values
+        e = (x - m).exp()
         return e / (e.sum(dim=dim, keepdim=True) + 1e-12)
 
-    @staticmethod
-    def _stable_masked_softmax(values: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        vmax = values.max(dim=dim, keepdim=True).values
-        e = (values - vmax).exp()
-        return e / (e.sum(dim=dim, keepdim=True) + 1e-12)
+    def forward(self, x: torch.Tensor):
+        B = x.size(0)
+        cache_key = (B, str(x.device))
+        if not self.training and cache_key in self._cache:
+            return self._cache[cache_key]
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # router logits
-        router_logits = self.gating_network(x)  # [B, M]
-        scaled_logits = router_logits / float(self.tau)
+        logits = self.gating(x) / float(self.tau)
+        probs = self._stable_softmax(logits, dim=-1)
 
-        # full probs for balancing
-        probs = self._stable_softmax(scaled_logits, dim=-1)  # [B, M]
+        topc_vals, topc_idx = torch.topk(logits, k=self.top_c, dim=-1)
+        topk_vals, pos_in_c = torch.topk(topc_vals, k=self.top_k, dim=-1)
+        topk_idx = torch.gather(topc_idx, 1, pos_in_c)
+        topk_weights = self._stable_softmax(topk_vals, dim=-1)
 
-        # top-C candidates on scaled logits
-        topc_vals, topc_idx = torch.topk(scaled_logits, k=self.top_c, dim=-1)  # [B, C]
-
-        # top-K among top-C
-        topk_vals, topk_pos_in_C = torch.topk(topc_vals, k=self.top_k, dim=-1)  # [B, K]
-        topk_idx = torch.gather(topc_idx, dim=1, index=topk_pos_in_C)  # [B, K]
-
-        # weights over the chosen K
-        topk_weights = self._stable_masked_softmax(topk_vals, dim=-1)  # [B, K]
-
-        return topk_idx, topk_weights, probs, topc_idx
+        out = (topk_idx, topk_weights, probs, topc_idx)
+        if not self.training:
+            self._cache[cache_key] = out
+        return out
 
 
-# ---------------- Load-balance loss (Switch-style) ----------------
+# ---------------- Load-balance loss ----------------
 def load_balance_loss(probs: torch.Tensor,
                       topk_idx: torch.Tensor,
                       topk_weights: torch.Tensor,
                       num_experts: int,
                       eps: float = 1e-12) -> torch.Tensor:
-    """
-    L = M * sum_i f_i * p_i
-    where f_i = fraction of routed mass to expert i
-          p_i = mean_t probs[t,i]
-    """
-    B = probs.size(0)
-    M = num_experts
-    device = probs.device
-    dtype = probs.dtype
-
-    K = topk_idx.size(1)
-    flat_idx = topk_idx.reshape(-1)  # [B*K]
+    flat_idx = topk_idx.reshape(-1)
     flat_w = topk_weights.reshape(-1)
-
     mask = flat_w > eps
     if mask.sum() == 0:
-        return torch.tensor(0.0, device=device, dtype=dtype)
+        return torch.tensor(0.0, device=probs.device, dtype=probs.dtype)
 
     flat_idx = flat_idx[mask]
     flat_w = flat_w[mask]
-
-    hat_ell = torch.zeros((M,), device=device, dtype=dtype)
+    hat_ell = torch.zeros((num_experts,), device=probs.device, dtype=probs.dtype)
     hat_ell = hat_ell.index_add(0, flat_idx, flat_w)
-
     total_mass = hat_ell.sum().clamp_min(eps)
     f = hat_ell / total_mass
-
     p_bar = probs.mean(dim=0).clamp_min(eps)
-
-    f = f.clamp_min(eps)
-
-    L = float(M) * torch.dot(f, p_bar)
+    L = float(num_experts) * torch.dot(f, p_bar)
     return L
 
 
@@ -169,21 +267,19 @@ class FlashMoEModel(nn.Module):
         capacity_factor: float = 1.25,
         tau: float = 1.0,
         top_c: Optional[int] = None,
-        # expert selection
-        expert_type: str = "lowrank",            # 'lowrank' or 'dense'
+        expert_type: str = "lowrank",
         d_hidden_override: Optional[int] = None,
         r_override: Optional[int] = None,
         target_k_budget: Optional[int] = None,
-        # capacity behavior
-        capacity_mode: str = "reroute_then_drop",  # 'reroute_then_drop', 'drop', 'none'
+        capacity_mode: str = "reroute_then_drop",
         drop_penalty: float = 0.0,
-        # misc
+        use_quant: bool = False,
         return_router_info_default: bool = False,
     ):
         super().__init__()
         assert top_k >= 1 and top_k <= num_experts
         if capacity_mode not in ("reroute_then_drop", "drop", "none"):
-            raise ValueError("capacity_mode must be in {'reroute_then_drop','drop','none'}")
+            raise ValueError("capacity_mode must be one of 'reroute_then_drop','drop','none'")
 
         self.d_model = d_model
         self.num_experts = num_experts
@@ -194,107 +290,77 @@ class FlashMoEModel(nn.Module):
         self.top_c = top_c if top_c is not None else min(num_experts, max(4, 2 * top_k))
         self.capacity_mode = capacity_mode
         self.drop_penalty = float(drop_penalty)
+        self.use_quant = bool(use_quant)
         self.return_router_info_default = bool(return_router_info_default)
 
-        # Shared encoder
         self.shared_encoder = nn.Linear(d_model, d_model)
-
-        # Gating network
         self.gating_network = GatingNetwork(d_model, num_experts, top_k, tau, top_c=self.top_c)
 
-        # Expert factory
         if expert_type not in ("lowrank", "dense"):
             raise ValueError("expert_type must be 'lowrank' or 'dense'")
+
         if expert_type == "dense":
             chosen_hidden = choose_dense_hidden(d_model, target_k=target_k_budget, d_hidden_override=d_hidden_override or d_hidden)
-            self.experts = nn.ModuleList([DenseSmallMLPExpert(d_model, chosen_hidden) for _ in range(num_experts)])
+            self.experts = nn.ModuleList([DenseSmallMLPExpert(d_model, chosen_hidden, use_quant=self.use_quant) for _ in range(num_experts)])
         else:
             chosen_r = choose_lowrank_r(d_model, target_k=target_k_budget, r_override=r_override)
-            self.experts = nn.ModuleList([LowRankExpert(d_model, chosen_r) for _ in range(num_experts)])
+            self.experts = nn.ModuleList([LowRankExpert(d_model, chosen_r, use_quant=self.use_quant) for _ in range(num_experts)])
 
-        # Bookkeeping
         self.register_buffer("last_overflow_rate", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_overflow_count", torch.tensor(0, dtype=torch.long), persistent=False)
         self.register_buffer("last_dropped_count", torch.tensor(0, dtype=torch.long), persistent=False)
         self.register_buffer("last_drop_rate", torch.tensor(0.0), persistent=False)
 
+    # ---------------- training/eval forward (strict capacity, as before) ----------------
     def forward(self, x: torch.Tensor, return_router_info: Optional[bool] = None):
-        """
-        Forward with strict capacity enforcement (depending on capacity_mode).
-        If return_router_info True, returns (y, info_dict) else returns y.
-        """
         if return_router_info is None:
             return_router_info = self.return_router_info_default
 
         device = x.device
-        dtype = x.dtype
         B = x.size(0)
         M = self.num_experts
         K = self.top_k
         C = self.top_c
 
-        # Encode
-        encoded = self.shared_encoder(x)  # [B, d]
+        encoded = self.shared_encoder(x)
+        topk_idx, topk_weights, probs, topc_idx = self.gating_network(encoded)
 
-        # Router
-        topk_idx, topk_weights, probs, topc_idx = self.gating_network(encoded)  # [B,K],[B,K],[B,M],[B,C]
+        tok_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, K).reshape(-1)
+        exp_idx = topk_idx.reshape(-1)
+        w_flat = topk_weights.reshape(-1)
 
-        # Flatten assignments
-        tok_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, K).reshape(-1)  # [B*K]
-        exp_idx = topk_idx.reshape(-1)  # [B*K]
-        w_flat = topk_weights.reshape(-1)  # [B*K]
-
-        # Filter tiny weights
-        keep_mask_flat = w_flat > 1e-12
-        if keep_mask_flat.sum() == 0:
-            # nothing routed
+        keep_mask = w_flat > 1e-12
+        if keep_mask.sum() == 0:
             self.last_overflow_count = torch.tensor(0, device=device)
             self.last_overflow_rate = torch.tensor(0.0, device=device)
             self.last_dropped_count = torch.tensor(0, device=device)
             self.last_drop_rate = torch.tensor(0.0, device=device)
             if return_router_info:
-                info = {
-                    "probs": probs,
-                    "topk_idx": topk_idx,
-                    "topk_weights": topk_weights,
-                    "topc_idx": topc_idx,
-                    "cap": 0,
-                    "num_dropped": torch.tensor(0, device=device),
-                    "overflow_count": torch.tensor(0, device=device),
-                }
+                info = {"probs": probs, "topk_idx": topk_idx, "topk_weights": topk_weights, "topc_idx": topc_idx,
+                        "cap": 0, "num_dropped": torch.tensor(0, device=device), "overflow_count": torch.tensor(0, device=device)}
                 return encoded, info
             return encoded
 
-        tok_idx = tok_idx[keep_mask_flat]
-        exp_idx = exp_idx[keep_mask_flat]
-        w_flat = w_flat[keep_mask_flat]
-
+        tok_idx = tok_idx[keep_mask]
+        exp_idx = exp_idx[keep_mask]
+        w_flat = w_flat[keep_mask]
         total_assignments = int(B * K)
 
-        # Sort by expert id to make groups contiguous
         order = torch.argsort(exp_idx)
         exp_sorted = exp_idx[order]
         tok_sorted = tok_idx[order]
         w_sorted = w_flat[order]
 
-        # Unique consecutive experts and counts
         unique_experts, counts = torch.unique_consecutive(exp_sorted, return_counts=True)
         num_active = unique_experts.size(0)
 
-        # Capacity
         cap = math.ceil(self.capacity_factor * (K * B) / float(M))
 
-        # Prepare output
         y = encoded.clone()
-
-        # Track overflow tokens per expert (list of tensors)
         overflow_tokens_per_expert = []
         overflow_count = 0
-
-        # Track assigned_count per expert to compute remaining_cap later
         assigned_count = torch.zeros((M,), dtype=torch.long, device=device)
 
-        # Phase 1: per-expert keep top-cap tokens
         offset = 0
         for i in range(num_active):
             e = int(unique_experts[i].item())
@@ -303,92 +369,67 @@ class FlashMoEModel(nn.Module):
             t = offset + n
             offset = t
 
-            toks = tok_sorted[s:t]   # [n]
-            ws = w_sorted[s:t]      # [n]
+            toks = tok_sorted[s:t]
+            ws = w_sorted[s:t]
 
             if n <= cap:
-                # keep all
                 assigned_count[e] += n
                 if n > 0:
                     xb = encoded[toks]
-                    expert = self.experts[e]
-                    yb = expert(xb)
+                    yb = self.experts[e](xb)
                     delta = yb - xb
                     y.index_add_(0, toks, delta * ws.unsqueeze(-1))
             else:
-                # overflow: keep top cap by weight (tie-break by token id ascending)
                 overflow_count += (n - cap)
-                # compute order with stable sorts: first token id asc, then weight desc
                 idx_tok = torch.argsort(toks, stable=True)
-                toks = toks[idx_tok]
-                ws = ws[idx_tok]
+                toks = toks[idx_tok]; ws = ws[idx_tok]
                 idx_w = torch.argsort(-ws, stable=True)
-                toks = toks[idx_w]
-                ws = ws[idx_w]
+                toks = toks[idx_w]; ws = ws[idx_w]
 
                 kept_toks = toks[:cap]
                 kept_ws = ws[:cap]
                 overflow_toks = toks[cap:]
-                # compute for kept
+
                 assigned_count[e] += kept_toks.numel()
                 if kept_toks.numel() > 0:
                     xb = encoded[kept_toks]
-                    expert = self.experts[e]
-                    yb = expert(xb)
+                    yb = self.experts[e](xb)
                     delta = yb - xb
                     y.index_add_(0, kept_toks, delta * kept_ws.unsqueeze(-1))
-                # collect overflow tokens
                 overflow_tokens_per_expert.append(overflow_toks)
 
-        # If no overflow, finalize
         if overflow_count == 0:
             self.last_overflow_count = torch.tensor(0, device=device)
             self.last_overflow_rate = torch.tensor(0.0, device=device)
             self.last_dropped_count = torch.tensor(0, device=device)
             self.last_drop_rate = torch.tensor(0.0, device=device)
             if return_router_info:
-                info = {
-                    "probs": probs,
-                    "topk_idx": topk_idx,
-                    "topk_weights": topk_weights,
-                    "topc_idx": topc_idx,
-                    "cap": cap,
-                    "num_dropped": torch.tensor(0, device=device),
-                    "overflow_count": torch.tensor(0, device=device),
-                }
+                info = {"probs": probs, "topk_idx": topk_idx, "topk_weights": topk_weights, "topc_idx": topc_idx,
+                        "cap": cap, "num_dropped": torch.tensor(0, device=device), "overflow_count": torch.tensor(0, device=device)}
                 return y, info
             return y
 
-        # Phase 2: greedy reroute across Top-C candidates
-        # Build all overflow tokens list
         if len(overflow_tokens_per_expert) > 0:
-            overflow_tokens_all = torch.cat(overflow_tokens_per_expert, dim=0)  # [N_over]
+            overflow_tokens_all = torch.cat(overflow_tokens_per_expert, dim=0)
         else:
             overflow_tokens_all = torch.empty((0,), dtype=torch.long, device=device)
 
-        # remaining capacity per expert
         remaining_cap = torch.full((M,), cap, dtype=torch.long, device=device)
-        # subtract what has been assigned in phase1
         remaining_cap -= assigned_count
         remaining_cap = remaining_cap.clamp_min(0)
 
         num_dropped = 0
         if overflow_tokens_all.numel() > 0 and self.capacity_mode != "none":
-            # candidates for overflow tokens
-            # topc_idx: [B, C]; pick rows corresponding to overflow tokens
             C = min(C, topc_idx.size(1))
-            cand_exps = topc_idx[overflow_tokens_all]  # [N_over, C]
-            cand_probs = probs[overflow_tokens_all]     # [N_over, M]
-            # gather candidate probs in shape [N_over, C]
-            cand_w = torch.gather(cand_probs, 1, cand_exps)  # [N_over, C]
+            cand_exps = topc_idx[overflow_tokens_all]
+            cand_probs = probs[overflow_tokens_all]
+            cand_w = torch.gather(cand_probs, 1, cand_exps)
 
-            # flatten and sort candidates by weight desc, then token id asc for determinism
             N_over = overflow_tokens_all.size(0)
-            token_expand = overflow_tokens_all.unsqueeze(1).expand(-1, C).reshape(-1)  # [N_over*C]
-            cand_exps_flat = cand_exps.reshape(-1)  # [N_over*C]
+            token_expand = overflow_tokens_all.unsqueeze(1).expand(-1, C).reshape(-1)
+            cand_exps_flat = cand_exps.reshape(-1)
             cand_w_flat = cand_w.reshape(-1)
 
-            # sort indices by (-weight, token id) -> use argsort twice (stable) for lexicographic
             order_tok = torch.argsort(token_expand, stable=True)
             token_expand = token_expand[order_tok]
             cand_exps_flat = cand_exps_flat[order_tok]
@@ -398,31 +439,27 @@ class FlashMoEModel(nn.Module):
             cand_exps_flat = cand_exps_flat[order_w]
             cand_w_flat = cand_w_flat[order_w]
 
-            # greedy assign
             token_assigned = torch.zeros((B,), dtype=torch.bool, device=device)
             reroute_tok = []
             reroute_exp = []
             reroute_w = []
 
-            # iterate (N_over * C moderate): use python loop for clarity
             for t_val, e_val, w_val in zip(token_expand.tolist(), cand_exps_flat.tolist(), cand_w_flat.tolist()):
                 if token_assigned[t_val]:
                     continue
                 e_int = int(e_val)
                 if remaining_cap[e_int].item() <= 0:
                     continue
-                # assign
                 token_assigned[t_val] = True
                 remaining_cap[e_int] -= 1
                 reroute_tok.append(t_val)
                 reroute_exp.append(e_int)
                 reroute_w.append(float(w_val))
 
-            # perform grouped compute for reroute assignments
             if len(reroute_tok) > 0:
                 rt = torch.tensor(reroute_tok, dtype=torch.long, device=device)
                 re = torch.tensor(reroute_exp, dtype=torch.long, device=device)
-                rw = torch.tensor(reroute_w, dtype=dtype, device=device)
+                rw = torch.tensor(reroute_w, dtype=torch.float32, device=device)
 
                 ord_r = torch.argsort(re)
                 re_s = re[ord_r]; rt_s = rt[ord_r]; rw_s = rw[ord_r]
@@ -433,48 +470,85 @@ class FlashMoEModel(nn.Module):
                     cnt = int(r_counts[i].item())
                     s = off; e = off + cnt; off = e
                     toks = rt_s[s:e]; ws = rw_s[s:e]
-                    if toks.numel() == 0:
-                        continue
                     xb = encoded[toks]
-                    expert = self.experts[eid]
-                    yb = expert(xb)
+                    yb = self.experts[eid](xb)
                     delta = yb - xb
                     y.index_add_(0, toks, delta * ws.unsqueeze(-1))
 
-            # count dropped tokens (those overflow tokens which were not assigned)
-            # token_assigned mask contains assigned status for tokens in [0..B-1]
-            # but we only consider overflow_tokens_all
             assigned_mask_over = token_assigned[overflow_tokens_all]
             num_assigned_over = int(assigned_mask_over.sum().item())
             num_dropped = int(overflow_tokens_all.numel() - num_assigned_over)
         else:
-            # no reroute (capacity_mode == 'none' or no overflow tokens)
             if self.capacity_mode == "drop":
-                # dropped tokens are overflow tokens
                 num_dropped = int(overflow_tokens_all.numel())
             else:
                 num_dropped = 0
 
-        # Bookkeeping
         self.last_overflow_count = torch.tensor(overflow_count, device=device)
         self.last_overflow_rate = torch.tensor(float(overflow_count) / max(1.0, total_assignments), device=device)
         self.last_dropped_count = torch.tensor(num_dropped, device=device)
         self.last_drop_rate = torch.tensor(float(num_dropped) / max(1.0, B), device=device)
 
         if return_router_info:
-            info = {
-                "probs": probs,
-                "topk_idx": topk_idx,
-                "topk_weights": topk_weights,
-                "topc_idx": topc_idx,
-                "cap": cap,
-                "num_dropped": torch.tensor(num_dropped, device=device),
-                "overflow_count": torch.tensor(overflow_count, device=device),
-            }
+            info = {"probs": probs, "topk_idx": topk_idx, "topk_weights": topk_weights, "topc_idx": topc_idx,
+                    "cap": cap, "num_dropped": torch.tensor(num_dropped, device=device),
+                    "overflow_count": torch.tensor(overflow_count, device=device)}
             return y, info
 
         return y
 
+    # ---------------- export-safe forward (traceable) ----------------
+    def forward_export(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Export-safe forward:
+        - deterministic, no Python branch on tensors
+        - uses Top-K routing but does NOT perform capacity clamping/reroute
+        - vectorized grouping by expert (loops over fixed num_experts)
+        """
+        device = x.device
+        B = x.size(0)
+        K = self.top_k
+
+        encoded = self.shared_encoder(x)  # [B, d]
+        topk_idx, topk_weights, probs, topc_idx = self.gating_network(encoded)  # tensors only
+
+        tok_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, K).reshape(-1)  # [B*K]
+        exp_idx = topk_idx.reshape(-1)  # [B*K]
+        w_flat = topk_weights.reshape(-1)  # [B*K]
+
+        mask = w_flat > 1e-12
+        tok_idx = tok_idx[mask]
+        exp_idx = exp_idx[mask]
+        w_flat = w_flat[mask]
+
+        # sort by expert id so tokens per expert are contiguous
+        if exp_idx.numel() == 0:
+            return encoded
+
+        order = torch.argsort(exp_idx)
+        exp_sorted = exp_idx[order]
+        tok_sorted = tok_idx[order]
+        w_sorted = w_flat[order]
+
+        y = encoded.clone()
+
+        # For exportability we avoid data-dependent python branching on tensors:
+        # iterate fixed-range over experts (python int)
+        for e in range(self.num_experts):
+            # find positions where exp_sorted == e
+            matches = exp_sorted == e  # boolean tensor
+            # get indices of matches in exp_sorted
+            pos = torch.nonzero(matches, as_tuple=False).reshape(-1)
+            if pos.numel() == 0:
+                continue
+            toks = tok_sorted[pos]
+            ws = w_sorted[pos]
+            xb = encoded[toks]
+            yb = self.experts[e](xb)
+            delta = yb - xb
+            y.index_add_(0, toks, delta * ws.unsqueeze(-1))
+
+        return y
 
     # ---------------- Training objective helpers ----------------
     def compute_loss(self,
@@ -484,56 +558,32 @@ class FlashMoEModel(nn.Module):
                      loss_type: str = "mse",
                      lambda_bal: float = 1e-3,
                      drop_penalty: Optional[float] = None) -> Tuple[torch.Tensor, dict]:
-        """
-        Compute training loss components and total:
-          L_task + lambda_bal * L_balance + optional drop_penalty * drop_frac
-
-        Args:
-          y: model outputs [B, d] (for 'mse') or logits [B, C] (for 'cross_entropy')
-          target: target tensor (same shape as y for mse, long labels for cross_entropy)
-          info: routing info dict with keys 'probs','topk_idx','topk_weights' (if None, load-balance term = 0)
-          loss_type: 'mse' or 'cross_entropy'
-          lambda_bal: weight for load-balance loss
-          drop_penalty: optional scalar weight for drop penalty (uses model.last_dropped_count)
-
-        Returns:
-          (total_loss, components) where components is a dict: {'L_task':..., 'L_bal':..., 'L_drop':...}
-        """
-        # Task loss
         if loss_type == "mse":
             L_task = F.mse_loss(y, target)
         elif loss_type == "cross_entropy":
-            # expects target: LongTensor of labels
             L_task = F.cross_entropy(y, target)
         else:
             raise ValueError("loss_type must be 'mse' or 'cross_entropy'")
 
-        # Load-balance loss
         if info is not None and "probs" in info and "topk_idx" in info and "topk_weights" in info:
             L_bal = load_balance_loss(info["probs"], info["topk_idx"], info["topk_weights"], self.num_experts)
         else:
             L_bal = torch.tensor(0.0, device=y.device, dtype=y.dtype)
 
-        # Drop penalty (fraction of tokens dropped)
         if drop_penalty is None:
-            if self.drop_penalty is not None:
-                drop_penalty = float(self.drop_penalty)
-            else:
-                drop_penalty = 0.0
+            drop_penalty = float(self.drop_penalty or 0.0)
 
         L_drop = torch.tensor(0.0, device=y.device, dtype=y.dtype)
-        if drop_penalty is not None and drop_penalty > 0.0:
-            # last_dropped_count is num tokens dropped (unique tokens); normalize by batch size
+        if drop_penalty > 0.0:
             B = y.size(0)
             drop_frac = float(self.last_dropped_count.item()) / max(1.0, float(B))
             L_drop = torch.tensor(drop_penalty * drop_frac, device=y.device, dtype=y.dtype)
 
         total = L_task + float(lambda_bal) * L_bal + L_drop
-        components = {"L_task": L_task.detach() if isinstance(L_task, torch.Tensor) else L_task,
-                      "L_bal": L_bal.detach() if isinstance(L_bal, torch.Tensor) else L_bal,
-                      "L_drop": L_drop.detach() if isinstance(L_drop, torch.Tensor) else L_drop}
-        return total, components
-
+        comps = {"L_task": L_task.detach() if isinstance(L_task, torch.Tensor) else L_task,
+                 "L_bal": L_bal.detach() if isinstance(L_bal, torch.Tensor) else L_bal,
+                 "L_drop": L_drop.detach() if isinstance(L_drop, torch.Tensor) else L_drop}
+        return total, comps
 
     def training_step(self,
                       x: torch.Tensor,
@@ -542,10 +592,6 @@ class FlashMoEModel(nn.Module):
                       loss_type: str = "mse",
                       lambda_bal: float = 1e-3,
                       drop_penalty: Optional[float] = None) -> Tuple[torch.Tensor, dict]:
-        """
-        Convenience helper that runs a forward, computes the training objective,
-        backprops, and takes an optimizer step. Returns (total_loss, components).
-        """
         self.train()
         optimizer.zero_grad()
         y, info = self(x, return_router_info=True)
@@ -553,3 +599,182 @@ class FlashMoEModel(nn.Module):
         total.backward()
         optimizer.step()
         return total.detach(), comps
+
+# ---------------- Evaluation & Export Helpers ----------------
+def evaluate_router_topk_accuracy(model: FlashMoEModel, dataloader: Iterable[torch.Tensor], device: torch.device):
+    model.eval()
+    total_tokens = 0
+    hits = 0
+    with torch.no_grad():
+        for x in dataloader:
+            x = x.to(device)
+            encoded = model.shared_encoder(x)
+            topk_idx, topk_weights, probs, topc_idx = model.gating_network(encoded)
+            argmax = torch.argmax(probs, dim=-1)
+            B = x.size(0)
+            total_tokens += B
+            matches = (topk_idx == argmax.unsqueeze(-1)).any(dim=-1)
+            hits += int(matches.sum().item())
+    rate = float(hits) / float(max(1, total_tokens))
+    return {"topk_contains_argmax_rate": rate, "total_tokens": total_tokens}
+
+
+def estimate_flops_saved(model: FlashMoEModel, dataloader: Iterable[torch.Tensor], device: torch.device):
+    model.eval()
+    dense_flops_total = 0.0
+    moe_flops_total = 0.0
+    total_tokens = 0
+
+    def linear_flops(in_f, out_f):
+        return 2.0 * in_f * out_f
+
+    d = model.d_model
+    d_hidden = model.d_hidden
+    dense_encoder = linear_flops(d, d)
+    dense_mlp = linear_flops(d, d_hidden) + linear_flops(d_hidden, d)
+    dense_per_token = dense_encoder + dense_mlp
+
+    with torch.no_grad():
+        for x in dataloader:
+            x = x.to(device)
+            B = x.size(0)
+            total_tokens += B
+            dense_flops_total += dense_per_token * B
+
+            moe_flops = linear_flops(d, d) * B
+            moe_flops += linear_flops(d, model.num_experts) * B
+
+            encoded = model.shared_encoder(x)
+            topk_idx, topk_weights, probs, topc_idx = model.gating_network(encoded)
+            flat_idx = topk_idx.reshape(-1)
+            flat_w = topk_weights.reshape(-1)
+            mask = flat_w > 1e-12
+            if mask.sum() == 0:
+                moe_flops_total += moe_flops
+                continue
+            flat_idx = flat_idx[mask]
+            counts = torch.bincount(flat_idx, minlength=model.num_experts).to(torch.long)
+
+            if isinstance(model.experts[0], LowRankExpert):
+                r = model.experts[0].U.weight.shape[0]
+                expert_flops_per_token = 2.0 * d * r
+            else:
+                expert_flops_per_token = linear_flops(d, d_hidden) + linear_flops(d_hidden, d)
+
+            for e in range(model.num_experts):
+                n = int(counts[e].item())
+                moe_flops += expert_flops_per_token * n
+
+            moe_flops_total += moe_flops
+
+    if total_tokens == 0:
+        return {"dense_flops": 0.0, "moe_flops": 0.0, "flops_saved_ratio": 0.0}
+
+    flops_saved = dense_flops_total - moe_flops_total
+    saved_ratio = float(flops_saved / max(1.0, dense_flops_total))
+    return {"dense_flops": dense_flops_total, "moe_flops": moe_flops_total, "flops_saved_ratio": saved_ratio}
+
+
+def compute_utilization_histogram(model: FlashMoEModel, dataloader: Iterable[torch.Tensor], device: torch.device):
+    model.eval()
+    M = model.num_experts
+    counts = torch.zeros((M,), dtype=torch.long, device=device)
+    mass = torch.zeros((M,), dtype=torch.float32, device=device)
+    probs_accum = torch.zeros((M,), dtype=torch.float32, device=device)
+    total_tokens = 0
+
+    with torch.no_grad():
+        for x in dataloader:
+            x = x.to(device)
+            B = x.size(0)
+            total_tokens += B
+            encoded = model.shared_encoder(x)
+            topk_idx, topk_weights, probs, topc_idx = model.gating_network(encoded)
+            flat_idx = topk_idx.reshape(-1)
+            flat_w = topk_weights.reshape(-1)
+            mask = flat_w > 1e-12
+            if mask.sum() > 0:
+                idx = flat_idx[mask]
+                w = flat_w[mask]
+                mass.index_add_(0, idx, w)
+                counts.index_add_(0, idx, torch.ones_like(idx, dtype=torch.long))
+            probs_accum += probs.sum(dim=0)
+
+    total_mass = float(mass.sum().item()) if mass.sum().item() > 0 else 1.0
+    f = (mass / total_mass).cpu().numpy().tolist()
+    p_bar = (probs_accum / max(1, total_tokens)).cpu().numpy().tolist()
+    counts_list = counts.cpu().numpy().tolist()
+
+    return {"expert_counts": counts_list, "f": f, "p_bar": p_bar, "total_tokens": total_tokens}
+
+
+def export_torchscript(model: FlashMoEModel, example_input: torch.Tensor, path: str, strict: bool = True):
+    """
+    Export the model's export-safe forward (forward_export) to TorchScript.
+    We use torch.jit.trace_module(model, {'forward_export': example_input}) so that
+    module parameters remain parameters (not captured as constants).
+    """
+    model.eval()
+    # make sure input is detached and doesn't require grad
+    example_input = example_input.detach()
+    if example_input.requires_grad:
+        example_input = example_input.clone().detach()
+
+    # Trace the module method (so parameters are preserved as parameters)
+    traced = torch.jit.trace_module(model, {'forward_export': example_input}, strict=strict)
+
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    traced.save(path)
+    return path
+
+
+def export_onnx(model: FlashMoEModel, example_input: torch.Tensor, path: str, opset: int = 13, dynamic_axes: bool = True):
+    """
+    Export the model's export-safe forward (forward_export) to ONNX.
+    Call torch.onnx.export with the bound method model.forward_export (no closure).
+    """
+    model.eval()
+    example_input = example_input.detach()
+    if example_input.requires_grad:
+        example_input = example_input.clone().detach()
+
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    dynamic_axis = {"input": {0: "batch_size"}, "output": {0: "batch_size"}} if dynamic_axes else None
+
+    # Export the bound method directly (avoids closure-captured tensors becoming constants)
+    torch.onnx.export(model.forward_export,
+                      example_input,
+                      path,
+                      input_names=["input"],
+                      output_names=["output"],
+                      dynamic_axes=dynamic_axis if dynamic_axes else None,
+                      opset_version=opset)
+    return path
+
+
+# ---------------- Smoke test ----------------
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    d_model = 128
+    num_experts = 8
+    d_hidden = 256
+    top_k = 2
+    B = 16
+
+    model = FlashMoEModel(d_model=d_model, num_experts=num_experts, d_hidden=d_hidden, top_k=top_k)
+    model.train()
+    x = torch.randn(B, d_model)
+    y = model(x)
+    print("output shape:", y.shape)
+    target = torch.randn_like(y)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss = F.mse_loss(y, target)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    print("train step ok; last_overflow_rate=", model.last_overflow_rate.item())
