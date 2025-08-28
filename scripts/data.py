@@ -1,103 +1,95 @@
+# scripts/data.py
 import torch
 from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset
-from transformers import AutoTokenizer
-import logging
+from torchtext.datasets import WikiText2
+from torchtext.data.utils import get_tokenizer
+from collections import Counter
+from torchtext.vocab import Vocab
+from typing import Tuple
 
-class Wikitext2Dataset(Dataset):
-    """Custom PyTorch Dataset for Wikitext-2."""
-    def __init__(self, data, seq_len):
-        self.data = data
-        self.seq_len = seq_len
+
+SPECIALS = ['<unk>', '<pad>']
+
+
+def _build_vocab() -> Tuple[Vocab, callable]:
+    tok = get_tokenizer("basic_english")
+    counter = Counter()
+    for line in WikiText2(split='train'):
+        counter.update(tok(line))
+    vocab = Vocab(counter, specials=SPECIALS)
+    vocab.set_default_index(vocab['<unk>'])
+    return vocab, tok
+
+
+def _encode_split(vocab: Vocab, tok, split: str) -> torch.Tensor:
+    ids = []
+    for line in WikiText2(split=split):
+        ids.extend([vocab[token] for token in tok(line)])
+    # add simple EOS between lines to avoid cross-line leakage (optional)
+    return torch.tensor(ids, dtype=torch.long)
+
+
+class LMChunkDataset(Dataset):
+    """
+    Turn a 1D token-id stream into fixed-length [T] inputs and [T] targets.
+    No padding; last partial chunk is dropped (keeps shapes consistent).
+    """
+    def __init__(self, ids: torch.Tensor, seq_len: int):
+        assert ids.dim() == 1
+        self.ids = ids
+        self.seq_len = int(seq_len)
+        # we need at least (seq_len + 1) tokens to form one (x, y) pair
+        self.n = (len(ids) - 1) // self.seq_len
 
     def __len__(self):
-        # The number of sequences we can create
-        return (self.data.size(0) - 1) // self.seq_len
+        return max(0, self.n)
 
-    def __getitem__(self, idx):
-        start_idx = idx * self.seq_len
-        end_idx = start_idx + self.seq_len
-        # Input is the sequence, target is the sequence shifted by one
-        inputs = self.data[start_idx:end_idx]
-        targets = self.data[start_idx + 1:end_idx + 1]
-        return inputs, targets
+    def __getitem__(self, idx: int):
+        i = idx * self.seq_len
+        x = self.ids[i: i + self.seq_len]                 # [T]
+        y = self.ids[i + 1: i + 1 + self.seq_len]         # [T]
+        return x, y
 
-def get_wikitext2_data(batch_size: int, seq_len: int, cache_dir: str = "./artifacts/data", debug: bool = False):
+
+def _collate(batch):
+    # All items are length-T already; just stack to [B, T]
+    xs, ys = zip(*batch)
+    return torch.stack(xs, dim=0), torch.stack(ys, dim=0)
+
+
+def get_wikitext2_data(batch_size: int = 16,
+                       seq_len: int = 256,
+                       debug: bool = False):
     """
-    Loads, tokenizes, and prepares the Wikitext-2 dataset for language modeling.
-
-    Args:
-        debug (bool): If True, uses a small subset of the data for fast testing.
-
     Returns:
-        tuple: A tuple containing (train_loader, val_loader, test_loader, tokenizer).
+      train_loader, val_loader, test_loader, vocab
+    where each loader yields (inputs [B,T], targets [B,T]).
     """
-    logging.info("Loading GPT2 tokenizer...")
-    # Using GPT2 tokenizer as a standard subword tokenizer
-    tokenizer = AutoTokenizer.from_pretrained('gpt2', cache_dir=cache_dir)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    vocab, tok = _build_vocab()
+    pad_id = vocab['<pad>']  # kept for completeness; we don't pad in this pipeline
 
-    logging.info("Loading Wikitext-2 dataset...")
-    try:
-        # Try to load from cache first
-        dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', cache_dir=cache_dir)
-    except Exception as e:
-        logging.error(f"Failed to load dataset: {e}. Ensure you have an internet connection.")
-        raise
-
-    def tokenize_function(examples):
-        # Concatenate texts to handle documents properly
-        return tokenizer(examples['text'], add_special_tokens=True, truncation=False)
-
-    logging.info("Tokenizing dataset...")
-    tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-
-    def process_split(split_name):
-        # Concatenate all tokens from the split into a single tensor
-        all_tokens = [tok for sample in tokenized_datasets[split_name] for tok in sample['input_ids']]
-        return torch.tensor(all_tokens, dtype=torch.long)
-
-    train_data = process_split('train')
-    val_data = process_split('validation')
-    test_data = process_split('test')
+    train_ids = _encode_split(vocab, tok, 'train')
+    val_ids   = _encode_split(vocab, tok, 'valid')
+    test_ids  = _encode_split(vocab, tok, 'test')
 
     if debug:
-        logging.warning("Debug mode is enabled. Using a small subset of the data.")
-        num_debug_batches = 10
-        train_data = train_data[:batch_size * seq_len * num_debug_batches]
-        val_data = val_data[:batch_size * seq_len * num_debug_batches]
-        test_data = test_data[:batch_size * seq_len * num_debug_batches]
-    
-    logging.info(f"Train tokens: {len(train_data)}, Val tokens: {len(val_data)}, Test tokens: {len(test_data)}")
+        train_ids = train_ids[:50_000]   # tiny debug slice
+        val_ids   = val_ids[:10_000]
+        test_ids  = test_ids[:10_000]
 
-    train_dataset = Wikitext2Dataset(train_data, seq_len)
-    val_dataset = Wikitext2Dataset(val_data, seq_len)
-    test_dataset = Wikitext2Dataset(test_data, seq_len)
+    train_ds = LMChunkDataset(train_ids, seq_len)
+    val_ds   = LMChunkDataset(val_ids,   seq_len)
+    test_ds  = LMChunkDataset(test_ids,  seq_len)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              drop_last=True, num_workers=0, collate_fn=_collate)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              drop_last=True, num_workers=0, collate_fn=_collate)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+                              drop_last=True, num_workers=0, collate_fn=_collate)
 
-    logging.info(f"Created DataLoaders with {len(train_loader)} train batches, {len(val_loader)} val batches.")
-    
-    return train_loader, val_loader, test_loader, tokenizer
+    # Attach a couple of helpful attributes expected by downstream code.
+    # (len(vocab) works for vocab size; pad_token_id provided for CE ignore_index if needed)
+    vocab.pad_token_id = pad_id
 
-if __name__ == '__main__':
-    # Example of how to use the data loader
-    logging.basicConfig(level=logging.INFO)
-    B, T = 16, 256
-    train_loader, val_loader, test_loader, tokenizer = get_wikitext2_data(batch_size=B, seq_len=T)
-    
-    print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
-    
-    # Fetch one batch
-    inputs, targets = next(iter(train_loader))
-    print(f"Input batch shape: {inputs.shape}")
-    print(f"Target batch shape: {targets.shape}")
-    
-    # Decode an example
-    print("\n--- Example Decoded ---")
-    print("Input: ", tokenizer.decode(inputs[0].tolist()))
-    print("Target:", tokenizer.decode(targets[0].tolist()))
-    print("-----------------------")
+    return train_loader, val_loader, test_loader, vocab
