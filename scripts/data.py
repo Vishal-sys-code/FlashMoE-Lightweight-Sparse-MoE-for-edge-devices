@@ -1,70 +1,95 @@
 # scripts/data.py
 import torch
-from torch.utils.data import DataLoader, Dataset
-from datasets import load_dataset
-from transformers import AutoTokenizer
+from torch.utils.data import Dataset, DataLoader
+from torchtext.datasets import WikiText2
+from torchtext.data.utils import get_tokenizer
+from collections import Counter
+from torchtext.vocab import Vocab
+from typing import Tuple
 
 
-class LMBlockDataset(Dataset):
+SPECIALS = ['<unk>', '<pad>']
+
+
+def _build_vocab() -> Tuple[Vocab, callable]:
+    tok = get_tokenizer("basic_english")
+    counter = Counter()
+    for line in WikiText2(split='train'):
+        counter.update(tok(line))
+    vocab = Vocab(counter, specials=SPECIALS)
+    vocab.set_default_index(vocab['<unk>'])
+    return vocab, tok
+
+
+def _encode_split(vocab: Vocab, tok, split: str) -> torch.Tensor:
+    ids = []
+    for line in WikiText2(split=split):
+        ids.extend([vocab[token] for token in tok(line)])
+    # add simple EOS between lines to avoid cross-line leakage (optional)
+    return torch.tensor(ids, dtype=torch.long)
+
+
+class LMChunkDataset(Dataset):
     """
-    Takes a long tokenized sequence and cuts it into fixed-length blocks.
+    Turn a 1D token-id stream into fixed-length [T] inputs and [T] targets.
+    No padding; last partial chunk is dropped (keeps shapes consistent).
     """
-    def __init__(self, token_ids, block_size):
-        self.block_size = block_size
-        n_blocks = (len(token_ids) - 1) // block_size
-        self.inputs = []
-        self.targets = []
-        for i in range(n_blocks):
-            start = i * block_size
-            end = start + block_size
-            self.inputs.append(torch.tensor(token_ids[start:end], dtype=torch.long))
-            self.targets.append(torch.tensor(token_ids[start+1:end+1], dtype=torch.long))
+    def __init__(self, ids: torch.Tensor, seq_len: int):
+        assert ids.dim() == 1
+        self.ids = ids
+        self.seq_len = int(seq_len)
+        # we need at least (seq_len + 1) tokens to form one (x, y) pair
+        self.n = (len(ids) - 1) // self.seq_len
 
     def __len__(self):
-        return len(self.inputs)
+        return max(0, self.n)
 
-    def __getitem__(self, idx):
-        return self.inputs[idx], self.targets[idx]
+    def __getitem__(self, idx: int):
+        i = idx * self.seq_len
+        x = self.ids[i: i + self.seq_len]                 # [T]
+        y = self.ids[i + 1: i + 1 + self.seq_len]         # [T]
+        return x, y
 
 
-def get_wikitext2_data(batch_size=16, seq_len=128, debug=False):
+def _collate(batch):
+    # All items are length-T already; just stack to [B, T]
+    xs, ys = zip(*batch)
+    return torch.stack(xs, dim=0), torch.stack(ys, dim=0)
+
+
+def get_wikitext2_data(batch_size: int = 16,
+                       seq_len: int = 256,
+                       debug: bool = False):
     """
-    Returns train/val/test DataLoaders and the tokenizer.
-    Uses HuggingFace datasets + AutoTokenizer (GPT2 tokenizer by default).
+    Returns:
+      train_loader, val_loader, test_loader, vocab
+    where each loader yields (inputs [B,T], targets [B,T]).
     """
-    # Load dataset
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+    vocab, tok = _build_vocab()
+    pad_id = vocab['<pad>']  # kept for completeness; we don't pad in this pipeline
 
-    # Use GPT2 tokenizer (or switch to another if you want)
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    train_ids = _encode_split(vocab, tok, 'train')
+    val_ids   = _encode_split(vocab, tok, 'valid')
+    test_ids  = _encode_split(vocab, tok, 'test')
 
-    def tokenize_fn(examples):
-        return tokenizer(examples["text"], return_attention_mask=False)["input_ids"]
-
-    train_ids = sum(dataset["train"]["text"], [])
-    val_ids = sum(dataset["validation"]["text"], [])
-    test_ids = sum(dataset["test"]["text"], [])
-
-    # Tokenize (flatten text into one big list of IDs)
-    train_tokens = tokenizer(" ".join(train_ids), return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze().tolist()
-    val_tokens = tokenizer(" ".join(val_ids), return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze().tolist()
-    test_tokens = tokenizer(" ".join(test_ids), return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze().tolist()
-
-    # Wrap into block dataset
-    train_ds = LMBlockDataset(train_tokens, seq_len)
-    val_ds = LMBlockDataset(val_tokens, seq_len)
-    test_ds = LMBlockDataset(test_tokens, seq_len)
-
-    # Subset for debug mode
     if debug:
-        train_ds = torch.utils.data.Subset(train_ds, range(200))
-        val_ds = torch.utils.data.Subset(val_ds, range(50))
-        test_ds = torch.utils.data.Subset(test_ds, range(50))
+        train_ids = train_ids[:50_000]   # tiny debug slice
+        val_ids   = val_ids[:10_000]
+        test_ids  = test_ids[:10_000]
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size)
-    test_loader = DataLoader(test_ds, batch_size=batch_size)
+    train_ds = LMChunkDataset(train_ids, seq_len)
+    val_ds   = LMChunkDataset(val_ids,   seq_len)
+    test_ds  = LMChunkDataset(test_ids,  seq_len)
 
-    return train_loader, val_loader, test_loader, tokenizer
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              drop_last=True, num_workers=0, collate_fn=_collate)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              drop_last=True, num_workers=0, collate_fn=_collate)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+                              drop_last=True, num_workers=0, collate_fn=_collate)
+
+    # Attach a couple of helpful attributes expected by downstream code.
+    # (len(vocab) works for vocab size; pad_token_id provided for CE ignore_index if needed)
+    vocab.pad_token_id = pad_id
+
+    return train_loader, val_loader, test_loader, vocab
